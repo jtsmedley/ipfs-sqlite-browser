@@ -1,31 +1,34 @@
-import { initBackend } from 'absurd-sql/dist/indexeddb-main-thread';
+import { initBackend } from "absurd-sql/dist/indexeddb-main-thread";
 import { CID } from "multiformats/cid";
-import Dexie from 'dexie';
-import _ from 'lodash';
+import Dexie from "dexie";
 import Bottleneck from "bottleneck";
-import { UnixFS } from 'ipfs-unixfs';
-import { concat as uint8ArrayConcat } from 'uint8arrays/concat'
 
 const cacheLimiter = new Bottleneck({
-  maxConcurrent: 100
+  maxConcurrent: 100,
 });
 
 function init() {
-  let worker = new Worker(new URL('./index.worker.js', import.meta.url));
+  let worker = new Worker(new URL("./index.worker.js", import.meta.url));
   // This is only required because Safari doesn't support nested
   // workers. This installs a handler that will proxy creating web
   // workers through the main thread
   initBackend(worker);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 class IPFSSQLiteDB {
-  #DatabaseConfigurationCID
-  #DatabaseConfiguration
+  #DatabaseConfigurationCID;
+  #DatabaseConfiguration;
 
-  #backupConfigurationDatabase
-  #backupConfigurationMetadata
+  #databaseData;
+  #databaseWALData;
+  #databaseSHMData;
+  #databaseMetadata;
 
-  #databaseData
+  #runningCID = null;
 
   #ipfsClient = undefined;
 
@@ -33,27 +36,59 @@ class IPFSSQLiteDB {
     this.#DatabaseConfigurationCID = DatabaseConfigurationCID;
   }
 
-  async refreshDatabaseConfiguration() {
+  async refreshDatabaseConfiguration(ipfsCID = this.#DatabaseConfigurationCID) {
     if (this.#ipfsClient === undefined) {
       this.#ipfsClient = await window.Ipfs.create();
     }
+    let protocol = ipfsCID.split("/")[1];
+    let backupConfigurationCID;
+    let metadataConfigurationCID;
+    debugger;
+    if (protocol === "ipns") {
+      let metadataResultCID = await this.#resolveIPNS(`${ipfsCID}`);
+      metadataConfigurationCID = metadataResultCID.Path.slice(6);
+      backupConfigurationCID = metadataConfigurationCID;
+    } else if (protocol === "ipfs") {
+      backupConfigurationCID = ipfsCID.split("/")[2];
+    } else {
+      throw new Error(`Invalid Protocol: ${protocol}`);
+    }
 
-    this.#DatabaseConfiguration = (await this.#ipfsClient.dag.get(CID.parse(this.#DatabaseConfigurationCID))).value;
+    let databaseMetadata;
+    try {
+      //TODO: Timeout handler
+      databaseMetadata = (
+        await this.#ipfsClient.dag.get(CID.parse(backupConfigurationCID))
+      ).value;
 
-    this.#DatabaseConfiguration.Data = (UnixFS.unmarshal(this.#DatabaseConfiguration.Data)).data;
-    this.#DatabaseConfiguration.Data = JSON.parse(new TextDecoder().decode(this.#DatabaseConfiguration.Data));
+      this.#DatabaseConfiguration = (
+        await this.#ipfsClient.dag.get(databaseMetadata.Versions.Current)
+      ).value;
+    } catch (err) {
+      console.error(err.message);
+    }
 
-    if (typeof this.#backupConfigurationDatabase === 'undefined') {
-      this.#backupConfigurationDatabase = new Dexie(`${this.#DatabaseConfiguration.Data.Name}-CID-Map`);
-      this.#backupConfigurationDatabase.version(1).stores({
-        pages: 'id'
+    //Unmarshal Data and Parse JSON
+    this.#DatabaseConfiguration.Data = databaseMetadata;
+
+    //Connect to Data Database for SQLite Pages
+    if (typeof this.#databaseData === "undefined") {
+      this.#databaseData = new Dexie(
+        `${this.#DatabaseConfiguration.Data.Name}.sqlite3`
+      );
+      this.#databaseData.version(0.2).stores({
+        data: "",
       });
     }
 
-    if (typeof this.#databaseData === 'undefined') {
-      this.#databaseData = new Dexie(`${this.#DatabaseConfiguration.Data.Name}.sqlite3`);
-      this.#databaseData.version(.2).stores({
-        data: ""
+    //Connect to Metadata Database
+    if (typeof this.#databaseMetadata === "undefined") {
+      this.#databaseMetadata = new Dexie(
+        `${this.#DatabaseConfiguration.Data.Name}.sqlite3-metadata`
+      );
+      this.#databaseMetadata.version(1).stores({
+        currentPages: "",
+        changedPages: "",
       });
     }
 
@@ -62,122 +97,141 @@ class IPFSSQLiteDB {
 
   async backup() {
     //Call Export on DB
-
     //Get exclusive lock on indexedDB
-
     //Recursively build links. Either using data to build new CID or using stored CID from previous version
-
     //Release exclusive lock on indexedDB
-
     //Build DAG using new Links
-
     //Publish DAG
-
     //Pin DAG
-
     //Confirm File is Pinned
   }
 
   async savePageToDB(pageNumber, link) {
     let pageData = null;
-    if (this.#ipfsClient === undefined || true) {
-      pageData = await ((await fetch(`http://ipfs.io/ipfs/${link.Hash.toString()}`)).arrayBuffer());
-    } else {
-      let pageBlocks = [];
-      for await (const chunk of this.#ipfsClient.cat(link.Hash.toString())) {
-        pageBlocks.push(chunk);
-      }
-      pageData = uint8ArrayConcat(pageBlocks);
-    }
+    pageData = await (
+      await fetch(`http://${link.Hash.toString()}.ipfs.localhost:8080/`)
+    ).arrayBuffer();
 
     //Save Page in Database
-    let saveReq = this.#databaseData.data.put(await pageData, pageNumber);
+    let saveReq = this.#databaseData.data.put(pageData, pageNumber);
 
-    saveReq.then(() => {
-      console.log(`Page Number ${pageNumber} Saved to IndexedDB at ${Date.now()}`);
-    }).catch((err) => {
-      console.error(err);
-      throw err;
-    })
+    saveReq
+      .then(() => {
+        console.log(
+          `Page Number ${pageNumber} Saved to IndexedDB at ${Date.now()}`
+        );
+      })
+      .catch((err) => {
+        console.error(err);
+        throw err;
+      });
+  }
+
+  async #resolveIPNS(ipfsCID) {
+    let ipnsResolveRequest = await fetch(
+      `http://localhost:8080/api/v0/name/resolve/${
+        ipfsCID.split("/")[2]
+      }?cacheBust=${Date.now()}`
+    );
+    let ipnsResolveResult = await ipnsResolveRequest.json();
+    return ipnsResolveResult;
+  }
+
+  async watch(ipnsKey) {
+    while (true) {
+      let currentCID = (await this.#resolveIPNS(ipnsKey)).Path;
+      if (this.#runningCID !== currentCID) {
+        try {
+          let backupConfiguration = await this.refreshDatabaseConfiguration(
+            currentCID
+          );
+          await this.restore(backupConfiguration);
+          this.#runningCID = currentCID;
+        } catch (err) {
+          console.error(err.message);
+        }
+      }
+
+      await sleep(5 * 1000);
+    }
   }
 
   async restore(currentBackupConfiguration) {
-    if (typeof currentBackupConfiguration === 'undefined') {
+    if (typeof currentBackupConfiguration === "undefined") {
       currentBackupConfiguration = await this.refreshDatabaseConfiguration();
     }
 
     let pageNumber = 0;
-    this.#backupConfigurationDatabase.pages.bulkPut(currentBackupConfiguration.Links.map((link) => {
-      return {
-        id: pageNumber++,
-        cid: link.Hash.toString()
-      };
-    })).then(function(lastKey) {
-      console.log("Last page id was: " + lastKey); // Will be 100000.
-    }).catch(Dexie.BulkError, function (e) {
-      // Explicitely catching the bulkAdd() operation makes those successful
-      // additions commit despite that there were errors.
-      console.error ("Some pages did not succeed. However, " + e.failures.length + " pages was added unsuccessfully");
-    });
-
-
-    let pageNumber2 = 0;
     let pageRestoresInProgress = [];
+    debugger;
     for (let link of currentBackupConfiguration.Links) {
-      if (pageNumber2 === 0) {
+      let linkString = link.Hash.toString();
+
+      let existingLinkString = await this.#databaseMetadata.currentPages.get(
+        pageNumber
+      );
+      if (existingLinkString === linkString) {
+        console.log(`Skipping Page ${pageNumber}`);
+        pageNumber++;
+        continue;
+      }
+
+      if (pageNumber === 0) {
         let pageData = null;
-        if (this.#ipfsClient === undefined) {
-          pageData = await ((await fetch(`http://ipfs.io/ipfs/${link.Hash.toString()}`)).arrayBuffer());
-        } else {
-          let pageBlocks = [];
-          for await (const chunk of this.#ipfsClient.cat(link.Hash.toString())) {
-            pageBlocks.push(chunk);
-          }
-          pageData = uint8ArrayConcat(pageBlocks);
-        }
+        pageData = await (
+          await fetch(`http://${linkString}.ipfs.localhost:8080/`)
+        ).arrayBuffer();
 
         //Save Database File Length
-        this.#databaseData.data.put({
-          size: (pageData.length * currentBackupConfiguration.Links.length),
-          cid: this.#DatabaseConfigurationCID
-        }, -1);
+        this.#databaseData.data.put(
+          {
+            size: pageData.byteLength * currentBackupConfiguration.Links.length,
+            cid: this.#DatabaseConfigurationCID,
+          },
+          -1
+        );
 
-        await this.savePageToDB(pageNumber2, link);
-      } else if (pageNumber2 < 10 || true) {
-        pageRestoresInProgress.push(await cacheLimiter.schedule(() => this.savePageToDB(pageNumber2, link)));
+        await this.savePageToDB(pageNumber, link);
       } else {
-        this.#databaseData.data.put(link.Hash.toString(), pageNumber2);
+        const pageToSave = pageNumber,
+          linkToSave = link;
+        pageRestoresInProgress.push(
+          await cacheLimiter.schedule(() =>
+            this.savePageToDB(pageToSave, linkToSave)
+          )
+        );
       }
-      pageNumber2++;
+
+      this.#databaseMetadata.currentPages.put(linkString, pageNumber);
+
+      pageNumber++;
     }
 
-    await Promise.all(pageRestoresInProgress)
-
-    /*const cache = await caches.open(`${currentBackupConfiguration.Data.Name}`);
-    let currentCacheKeys = await cache.keys();
-    let urls = currentBackupConfiguration.Links.map((link) => {
-      return `http://ipfs.io/ipfs/${link.Hash.toString()}`
-    });
-
-    let cachePromises = [];
-    for (let url of urls) {
-      if (typeof _.find(currentCacheKeys, {
-        url: url
-      }) === "undefined") {
-        console.log(`Caching URL: ${url}`);
-         cachePromises.push(cacheLimiter.schedule(() => cache.add(url)));
-      }
-    }
-    await Promise.all(cachePromises);
-    console.log(`Cached Database`);*/
+    await Promise.all(pageRestoresInProgress);
   }
 }
 
-window.testDatabase = new IPFSSQLiteDB(`bafybeierr7rp2v2ej32u4vmn6rzc7ysch54ts7um55hpo645ea46cky2ae`);
+window.testDatabase = new IPFSSQLiteDB(
+  `/ipns/k2k4r8kvtxbn28ei25yc4o1eaisxsjtc17ptwzty6qyal1geiy0bpzat`
+);
 
-window.testDatabase.restore().then(() => {
-  init();
-})
+// window.testDatabase.restore().then(async () => {
+//   init();
+//   window.testDatabase.watch(
+//     `/ipns/k2k4r8kvtxbn28ei25yc4o1eaisxsjtc17ptwzty6qyal1geiy0bpzat`
+//   );
+//   while (true) {
+//     await sleep(10 * 1000);
+//     init();
+//   }
+// });
 
-
-
+(async function () {
+  window.testDatabase.watch(
+    `/ipns/k2k4r8kvtxbn28ei25yc4o1eaisxsjtc17ptwzty6qyal1geiy0bpzat`
+  );
+  while (true) {
+    await sleep(10 * 1000);
+    init();
+  }
+})();
