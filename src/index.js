@@ -1,7 +1,7 @@
 import { initBackend } from "absurd-sql/dist/indexeddb-main-thread";
-import { CID } from "multiformats/cid";
 import Dexie from "dexie";
 import Bottleneck from "bottleneck";
+import axios from "axios";
 
 const cacheLimiter = new Bottleneck({
   maxConcurrent: 100,
@@ -24,26 +24,21 @@ class IPFSSQLiteDB {
   #DatabaseConfiguration;
 
   #databaseData;
-  #databaseWALData;
-  #databaseSHMData;
   #databaseMetadata;
 
   #runningCID = null;
-
-  #ipfsClient = undefined;
+  #ipfsErrorCount = 0;
 
   constructor(DatabaseConfigurationCID) {
     this.#DatabaseConfigurationCID = DatabaseConfigurationCID;
   }
 
-  async refreshDatabaseConfiguration(ipfsCID = this.#DatabaseConfigurationCID) {
-    if (this.#ipfsClient === undefined) {
-      this.#ipfsClient = await window.Ipfs.create();
-    }
+  async #refreshDatabaseConfiguration(
+    ipfsCID = this.#DatabaseConfigurationCID
+  ) {
     let protocol = ipfsCID.split("/")[1];
     let backupConfigurationCID;
     let metadataConfigurationCID;
-    debugger;
     if (protocol === "ipns") {
       let metadataResultCID = await this.#resolveIPNS(`${ipfsCID}`);
       metadataConfigurationCID = metadataResultCID.Path.slice(6);
@@ -53,19 +48,34 @@ class IPFSSQLiteDB {
     } else {
       throw new Error(`Invalid Protocol: ${protocol}`);
     }
+    console.log(`Refreshing configuration from CID: ${backupConfigurationCID}`);
 
     let databaseMetadata;
     try {
-      //TODO: Timeout handler
-      databaseMetadata = (
-        await this.#ipfsClient.dag.get(CID.parse(backupConfigurationCID))
-      ).value;
+      console.log(`Getting metadata from CID: ${backupConfigurationCID}`);
+      let databaseMetadataResult = await axios({
+        url: `http://localhost:8080/api/v0/dag/get?arg=${backupConfigurationCID}`,
+        responseType: `json`,
+        timeout: 5000,
+      });
+      databaseMetadata = databaseMetadataResult.data;
 
-      this.#DatabaseConfiguration = (
-        await this.#ipfsClient.dag.get(databaseMetadata.Versions.Current)
-      ).value;
+      console.log(
+        `Getting backup from CID: ${databaseMetadata.Versions.Current["/"]}`
+      );
+      let databaseConfigurationResult = await axios({
+        url: `http://localhost:8080/api/v0/dag/get?arg=${databaseMetadata.Versions.Current["/"]}`,
+        responseType: `json`,
+        timeout: 5000,
+      });
+      databaseConfigurationResult.data.Links =
+        databaseConfigurationResult.data.links;
+      this.#DatabaseConfiguration = databaseConfigurationResult.data;
     } catch (err) {
+      this.#ipfsErrorCount++;
+
       console.error(err.message);
+      return false;
     }
 
     //Unmarshal Data and Parse JSON
@@ -106,14 +116,17 @@ class IPFSSQLiteDB {
     //Confirm File is Pinned
   }
 
-  async savePageToDB(pageNumber, link) {
-    let pageData = null;
-    pageData = await (
-      await fetch(`http://${link.Hash.toString()}.ipfs.localhost:8080/`)
-    ).arrayBuffer();
+  async #savePageToDB(pageNumber, link) {
+    let pageData = await axios({
+      url: `http://${
+        link.Cid["/"] || link.Hash.toString()
+      }.ipfs.localhost:8080/`,
+      responseType: `arraybuffer`,
+      timeout: 1000, //1 Seconds
+    });
 
     //Save Page in Database
-    let saveReq = this.#databaseData.data.put(pageData, pageNumber);
+    let saveReq = this.#databaseData.data.put(pageData.data, pageNumber);
 
     saveReq
       .then(() => {
@@ -128,76 +141,91 @@ class IPFSSQLiteDB {
   }
 
   async #resolveIPNS(ipfsCID) {
-    let ipnsResolveRequest = await fetch(
-      `http://localhost:8080/api/v0/name/resolve/${
+    let cacheBust = Math.floor(Date.now() / 1000 / 15); //15 second floored resolution on cachebusts
+
+    let ipnsResolveRequest = await axios({
+      url: `http://localhost:8080/api/v0/name/resolve/${
         ipfsCID.split("/")[2]
-      }?cacheBust=${Date.now()}`
-    );
-    let ipnsResolveResult = await ipnsResolveRequest.json();
-    return ipnsResolveResult;
+      }?cacheBust=${cacheBust}`,
+      responseType: `json`,
+      timeout: 1000, //1 Seconds
+    });
+    return ipnsResolveRequest.data;
   }
 
   async watch(ipnsKey) {
     while (true) {
-      let currentCID = (await this.#resolveIPNS(ipnsKey)).Path;
-      if (this.#runningCID !== currentCID) {
-        try {
-          let backupConfiguration = await this.refreshDatabaseConfiguration(
-            currentCID
-          );
-          await this.restore(backupConfiguration);
-          this.#runningCID = currentCID;
-        } catch (err) {
-          console.error(err.message);
+      try {
+        console.log(`Checking for changes in IPNS for Key: ${ipnsKey}`);
+        let currentCID = (await this.#resolveIPNS(ipnsKey)).Path;
+        if (this.#runningCID !== currentCID) {
+          console.log(`New Version Found: ${currentCID}`);
+          try {
+            console.log(`Fetching Latest Configuration`);
+            let backupConfiguration = await this.#refreshDatabaseConfiguration(
+              currentCID
+            );
+            if (backupConfiguration === false) {
+              throw new Error(`Failed to fetch latest configuration`);
+            }
+            console.log(`Starting Restore`);
+            await this.restore(backupConfiguration);
+            console.log(`Completed Restore`);
+            this.#runningCID = currentCID;
+          } catch (err) {
+            console.error(err.message);
+          }
         }
+        await sleep(5 * 1000);
+      } catch (err) {
+        console.error(err.message);
       }
-
-      await sleep(5 * 1000);
     }
   }
 
   async restore(currentBackupConfiguration) {
     if (typeof currentBackupConfiguration === "undefined") {
-      currentBackupConfiguration = await this.refreshDatabaseConfiguration();
+      currentBackupConfiguration = await this.#refreshDatabaseConfiguration();
     }
 
     let pageNumber = 0;
     let pageRestoresInProgress = [];
-    debugger;
     for (let link of currentBackupConfiguration.Links) {
-      let linkString = link.Hash.toString();
+      let linkString = link.Cid["/"] || link.Hash.toString();
 
       let existingLinkString = await this.#databaseMetadata.currentPages.get(
         pageNumber
       );
       if (existingLinkString === linkString) {
-        console.log(`Skipping Page ${pageNumber}`);
         pageNumber++;
         continue;
       }
 
       if (pageNumber === 0) {
-        let pageData = null;
-        pageData = await (
-          await fetch(`http://${linkString}.ipfs.localhost:8080/`)
-        ).arrayBuffer();
+        let pageData = await axios({
+          url: `http://${linkString}.ipfs.localhost:8080/`,
+          responseType: `arraybuffer`,
+          timeout: 1000, //1 Second
+        });
 
         //Save Database File Length
         this.#databaseData.data.put(
           {
-            size: pageData.byteLength * currentBackupConfiguration.Links.length,
+            size:
+              pageData.data.byteLength *
+              currentBackupConfiguration.Links.length,
             cid: this.#DatabaseConfigurationCID,
           },
           -1
         );
 
-        await this.savePageToDB(pageNumber, link);
+        await this.#savePageToDB(pageNumber, link);
       } else {
         const pageToSave = pageNumber,
           linkToSave = link;
         pageRestoresInProgress.push(
-          await cacheLimiter.schedule(() =>
-            this.savePageToDB(pageToSave, linkToSave)
+          cacheLimiter.schedule(() =>
+            this.#savePageToDB(pageToSave, linkToSave)
           )
         );
       }
@@ -215,23 +243,22 @@ window.testDatabase = new IPFSSQLiteDB(
   `/ipns/k2k4r8kvtxbn28ei25yc4o1eaisxsjtc17ptwzty6qyal1geiy0bpzat`
 );
 
-// window.testDatabase.restore().then(async () => {
-//   init();
-//   window.testDatabase.watch(
-//     `/ipns/k2k4r8kvtxbn28ei25yc4o1eaisxsjtc17ptwzty6qyal1geiy0bpzat`
-//   );
-//   while (true) {
-//     await sleep(10 * 1000);
-//     init();
-//   }
-// });
-
 (async function () {
-  window.testDatabase.watch(
+  let watchDatabase = window.testDatabase.watch(
     `/ipns/k2k4r8kvtxbn28ei25yc4o1eaisxsjtc17ptwzty6qyal1geiy0bpzat`
   );
-  while (true) {
-    await sleep(10 * 1000);
-    init();
-  }
+  let queryDatabase = (async function () {
+    let errorCount = 0;
+    while (errorCount < 50) {
+      await sleep(10 * 1000);
+      try {
+        init();
+      } catch (err) {
+        errorCount++;
+        console.error(err.message);
+      }
+    }
+  })();
+  await watchDatabase;
+  await queryDatabase;
 })();

@@ -34,10 +34,16 @@ async function runQueries() {
   let fullStart = Date.now();
   let result = stmt.step();
   while (result) {
-    // let start = Date.now();
+    let benchmarkData = {},
+      benchmark = true;
+    if (benchmark === true) {
+      benchmarkData.start = Date.now();
+    }
     let data = stmt.getAsObject();
-    // let stop = Date.now();
-    // console.log(`[${stop - start}ms] Result: `, data);
+    if (benchmark === true) {
+      benchmarkData.stop = Date.now();
+      console.log(`[${benchmarkData.stop - benchmarkData.start}ms]`);
+    }
     console.log(`Result: `, data);
     result = stmt.step();
   }
@@ -46,6 +52,10 @@ async function runQueries() {
   stmt.free();
 }
 
-runQueries().then((r) => {
-  console.log("Finished");
-});
+runQueries()
+  .then((r) => {
+    console.log("Finished");
+  })
+  .catch((err) => {
+    console.error(err.message);
+  });
